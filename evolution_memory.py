@@ -11,6 +11,37 @@ import random
 
 
 # ─────────────────────────────────────────────
+# THEME DEFINITIONS
+# ─────────────────────────────────────────────
+THEMES = {
+    0: {
+        "name": "Urban",
+        "base": [0.3, 0.3, 0.3],
+        "growth": [0.9, 0.9, 1.0],
+        "caption": "Urban expansion seen in the northern sector",
+    },
+    1: {
+        "name": "Forest",
+        "base": [0.1, 0.4, 0.1],
+        "growth": [0.6, 0.3, 0.1],
+        "caption": "Deforestation occurring in the rainforest",
+    },
+    2: {
+        "name": "Water",
+        "base": [0.0, 0.1, 0.6],
+        "growth": [0.3, 0.5, 0.2],
+        "caption": "River levels rising due to seasonal floods",
+    },
+    3: {
+        "name": "Desert",
+        "base": [0.8, 0.7, 0.3],
+        "growth": [0.6, 0.6, 0.6],
+        "caption": "New residential complex built on sandy terrain",
+    },
+}
+
+
+# ─────────────────────────────────────────────
 # DATASET
 # ─────────────────────────────────────────────
 class EvolutionSatelliteDataset(Dataset):
@@ -21,32 +52,8 @@ class EvolutionSatelliteDataset(Dataset):
       - Sentinel-2: temporal multi-frame image streams
     """
 
-    THEMES = {
-        0: {
-            "name": "Urban",
-            "base": [0.3, 0.3, 0.3],
-            "growth": [0.9, 0.9, 1.0],
-            "caption": "Urban expansion seen in the northern sector",
-        },
-        1: {
-            "name": "Forest",
-            "base": [0.1, 0.4, 0.1],
-            "growth": [0.6, 0.3, 0.1],
-            "caption": "Deforestation occurring in the rainforest",
-        },
-        2: {
-            "name": "Water",
-            "base": [0.0, 0.1, 0.6],
-            "growth": [0.3, 0.5, 0.2],
-            "caption": "River levels rising due to seasonal floods",
-        },
-        3: {
-            "name": "Desert",
-            "base": [0.8, 0.7, 0.3],
-            "growth": [0.6, 0.6, 0.6],
-            "caption": "New residential complex built on sandy terrain",
-        },
-    }
+    # Keep THEMES as class attribute so app.py can access via dataset.THEMES
+    THEMES = THEMES
 
     def __init__(self, size: int = 1000):
         self.size = size
@@ -56,26 +63,28 @@ class EvolutionSatelliteDataset(Dataset):
 
     def __getitem__(self, idx):
         theme_id = random.randint(0, 3)
-        return self._make_stream(theme_id), torch.tensor(theme_id)
+        return make_stream(theme_id), torch.tensor(theme_id)
 
     @classmethod
     def _make_stream(cls, theme_id: int) -> torch.Tensor:
-        """Generate a 5-frame temporal stream for the given theme."""
-        theme = cls.THEMES[theme_id]
-        stream = []
-        for t in range(5):
-            img = np.full((224, 224, 3), theme["base"], dtype=np.float32)
-            num_blobs = 2 + (t * 3)
-            for _ in range(num_blobs):
-                x = random.randint(0, 180)
-                y = random.randint(0, 180)
-                size = random.randint(15, 40)
-                img[x: x + size, y: y + size] = theme["growth"]
-            img += np.random.uniform(-0.05, 0.05, (224, 224, 3))
-            stream.append(
-                torch.from_numpy(np.clip(img, 0, 1)).permute(2, 0, 1)
-            )
-        return torch.stack(stream)
+        return make_stream(theme_id)
+
+
+def make_stream(theme_id: int) -> torch.Tensor:
+    """Generate a 5-frame temporal image stream for the given theme."""
+    theme = THEMES[theme_id]
+    stream = []
+    for t in range(5):
+        img = np.full((224, 224, 3), theme["base"], dtype=np.float32)
+        num_blobs = 2 + (t * 3)
+        for _ in range(num_blobs):
+            x = random.randint(0, 180)
+            y = random.randint(0, 180)
+            s = random.randint(15, 40)
+            img[x: x + s, y: y + s] = theme["growth"]
+        img += np.random.uniform(-0.05, 0.05, (224, 224, 3))
+        stream.append(torch.from_numpy(np.clip(img, 0, 1)).permute(2, 0, 1))
+    return torch.stack(stream)
 
 
 # ─────────────────────────────────────────────
@@ -90,15 +99,35 @@ class EpisodicMemoryBank(nn.Module):
     def __init__(self, embed_dim: int, capacity: int = 100):
         super().__init__()
         self.capacity = capacity
-        self.register_buffer("memory", torch.randn(capacity, embed_dim))
+        # Initialise to zeros — warm-up fills this before first real inference
+        self.register_buffer("memory", torch.zeros(capacity, embed_dim))
         self.ptr = 0
+        self.filled = 0  # tracks how many slots have real data
 
     def write(self, feature: torch.Tensor) -> None:
         self.memory[self.ptr] = feature.mean(dim=0).detach()
         self.ptr = (self.ptr + 1) % self.capacity
+        self.filled = min(self.filled + 1, self.capacity)
 
     def read(self) -> torch.Tensor:
         return self.memory
+
+    def warmup(self, encoder, num_samples: int = 25) -> None:
+        """
+        Pre-populate the memory bank before first user inference.
+        Runs `num_samples` synthetic images (all 4 themes equally)
+        through the encoder so the bank holds meaningful embeddings
+        rather than zeros or random noise.
+        Called once after weights are loaded.
+        """
+        self.eval()
+        with torch.no_grad():
+            for i in range(num_samples):
+                theme_id = i % 4
+                stream = make_stream(theme_id)
+                img = stream[-1].unsqueeze(0)   # (1, 3, 224, 224)
+                feat = encoder(img)             # (1, 768)
+                self.write(feat)
 
 
 # ─────────────────────────────────────────────
@@ -110,7 +139,7 @@ class EvolutionarySelector(nn.Module):
     then applies Gaussian mutation to simulate evolutionary pressure.
     """
 
-    def __init__(self, embed_dim: int, mutation_rate: float = 0.1):
+    def __init__(self, mutation_rate: float = 0.1):
         super().__init__()
         self.mutation_rate = mutation_rate
 
@@ -147,7 +176,7 @@ class EvolutionMemoryModel(nn.Module):
         embed_dim = self.encoder.config.hidden_size  # 768
 
         self.emb_bank = EpisodicMemoryBank(embed_dim)
-        self.selector = EvolutionarySelector(embed_dim)
+        self.selector = EvolutionarySelector()
 
         # 1 current embedding + 5 selected memories = 6 × 768
         self.decoder = nn.Sequential(
@@ -170,3 +199,16 @@ class EvolutionMemoryModel(nn.Module):
         combined = torch.cat([enc_out.unsqueeze(1), memories], dim=1)
         flat = combined.view(combined.size(0), -1)
         return self.decoder(flat)
+
+    def warmup_memory(self) -> None:
+        """
+        Must be called once after loading weights.
+        Populates the Episodic Memory Bank with meaningful embeddings
+        so the first user inference sees a correctly initialised bank.
+        """
+        self.eval()
+        self.emb_bank.warmup(self._encode, num_samples=25)
+
+    def _encode(self, img: torch.Tensor) -> torch.Tensor:
+        """Run ViT encoder on a single image, return CLS token."""
+        return self.encoder(img).last_hidden_state[:, 0, :]
