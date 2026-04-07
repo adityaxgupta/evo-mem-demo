@@ -1,26 +1,15 @@
-# app.py  —  EVO-MEM Streamlit Demo
-# Run:  streamlit run app.py
-
+import os
+import urllib.request
 import streamlit as st
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import random
+import json
+from evolution_memory import EvolutionSatelliteDataset, EvolutionMemoryModel
 
-from evolution_memory import (
-    EvolutionSatelliteDataset,
-    EvolutionMemoryModel,
-)
-
-# ──────────────────────────────────────────────────────
-# PAGE CONFIG
-# ──────────────────────────────────────────────────────
 st.set_page_config(
     page_title="EVO-MEM",
     page_icon=None,
@@ -28,9 +17,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ──────────────────────────────────────────────────────
-# CUSTOM CSS  —  clean, professional, no emojis
-# ──────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
@@ -42,17 +28,14 @@ st.markdown(
         color: #d4d4d4;
     }
 
-    /* Hide Streamlit chrome */
     #MainMenu, footer, header { visibility: hidden; }
     .block-container { padding: 2.5rem 3rem 2rem 3rem; max-width: 1200px; }
 
-    /* ── HEADER ── */
     .evo-header { border-bottom: 1px solid #2a2a2a; padding-bottom: 1.2rem; margin-bottom: 2rem; }
     .evo-label  { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; letter-spacing: 0.15em; color: #7a6a50; text-transform: uppercase; }
     .evo-title  { font-size: 3rem; font-weight: 600; letter-spacing: -0.03em; color: #e8e2d8; margin: 0.2rem 0 0.4rem 0; }
     .evo-sub    { font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; color: #666; }
 
-    /* ── SECTION LABELS ── */
     .section-label {
         font-family: 'JetBrains Mono', monospace;
         font-size: 0.68rem;
@@ -64,7 +47,6 @@ st.markdown(
         margin-bottom: 0.8rem;
     }
 
-    /* ── STAT PILLS ── */
     .stat-row { display: flex; gap: 0.8rem; margin: 1rem 0 1.4rem 0; flex-wrap: wrap; }
     .stat-pill {
         background: #181818;
@@ -88,7 +70,6 @@ st.markdown(
         margin-top: 0.1rem;
     }
 
-    /* ── CAPTION OUTPUT BOX ── */
     .caption-box {
         background: #141414;
         border: 1px solid #2a2a2a;
@@ -118,7 +99,6 @@ st.markdown(
         margin-top: 0.5rem;
     }
 
-    /* ── GROUND TRUTH BOX ── */
     .truth-box {
         background: #141414;
         border: 1px solid #2a2a2a;
@@ -145,19 +125,6 @@ st.markdown(
         margin-top: 0.3rem;
     }
 
-    /* ── TRAINING STATUS ── */
-    .train-status {
-        background: #141414;
-        border: 1px solid #2a2a2a;
-        border-radius: 4px;
-        padding: 1rem 1.2rem;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.78rem;
-        color: #888;
-        margin-bottom: 1rem;
-    }
-
-    /* ── RADIO BUTTONS (theme selector) ── */
     div[data-testid="stRadio"] label {
         font-size: 0.9rem !important;
         color: #bbb !important;
@@ -166,7 +133,6 @@ st.markdown(
         color: #e8e2d8 !important;
     }
 
-    /* ── PRIMARY BUTTON ── */
     div.stButton > button {
         background-color: #c8975a;
         color: #0f0f0f;
@@ -186,82 +152,40 @@ st.markdown(
         color: #0f0f0f;
     }
 
-    /* Matplotlib figure bg transparent */
     .stPlotlyChart, .stPyplot { background: transparent !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ──────────────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────────────
 THEMES = EvolutionSatelliteDataset.THEMES
-DEVICE = "cpu"   # Streamlit Cloud has no GPU; CPU is reliable here
+DEVICE = "cpu"
 
-
-# ──────────────────────────────────────────────────────
-# TRAINING  —  cached so it only runs once per session
-# ──────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_trained_model():
-    """
-    Trains EVO-MEM for 10 epochs on synthetic data, exactly replicating
-    the notebook pipeline. Cached so this only runs once on startup.
-    Returns the trained model and loss history.
-    """
+    weights_path = "evo_mem_weights.pth"
+    
+    # Auto-Download Logic for GitHub Releases
+    if not os.path.exists(weights_path):
+        with st.spinner("Downloading model weights (339MB)... This only happens once on server wake-up."):
+            url = "https://github.com/adityaxgupta/evo-mem-demo/releases/download/v1.0/evo_mem_weights.pth" 
+            urllib.request.urlretrieve(url, weights_path)
+            
     model = EvolutionMemoryModel(num_classes=4).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    criterion = nn.CrossEntropyLoss()
-
-    dataset = EvolutionSatelliteDataset(size=1000)
-    train_set, val_set = random_split(dataset, [800, 200])
-    train_loader = DataLoader(train_set, batch_size=8, shuffle=True)
-    val_loader   = DataLoader(val_set,   batch_size=8, shuffle=False)
-
-    t_hist, v_hist = [], []
-
-    for epoch in range(10):
-        # ── Train
-        model.train()
-        t_loss = 0.0
-        for images, labels in train_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            t_loss += loss.item()
-
-        # ── Validate
-        model.eval()
-        v_loss = 0.0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                v_loss += criterion(model(images), labels).item()
-
-        t_hist.append(t_loss / len(train_loader))
-        v_hist.append(v_loss / len(val_loader))
-
+    model.load_state_dict(torch.load(weights_path, map_location=DEVICE, weights_only=True))
     model.eval()
-    return model, t_hist, v_hist
+    
+    with open("training_history.json", "r") as f:
+        history = json.load(f)
+        
+    return model, history["t_hist"], history["v_hist"]
 
-
-# ──────────────────────────────────────────────────────
-# INFERENCE HELPER
-# ──────────────────────────────────────────────────────
 def run_pipeline(model, theme_id: int):
-    """
-    Generates a 5-frame stream for the chosen theme, passes it through
-    the trained EVO-MEM pipeline, and returns prediction + confidence scores.
-    """
-    stream = EvolutionSatelliteDataset._make_stream(theme_id)   # (5, 3, 224, 224)
-    stream_gpu = stream.unsqueeze(0).to(DEVICE)                 # (1, 5, 3, 224, 224)
+    stream = EvolutionSatelliteDataset._make_stream(theme_id)
+    stream_gpu = stream.unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        logits = model(stream_gpu)                              # (1, 4)
+        logits = model(stream_gpu)
         probs  = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
 
     pred_id    = int(np.argmax(probs))
@@ -271,10 +195,6 @@ def run_pipeline(model, theme_id: int):
 
     return stream, pred_id, pred_cap, truth_cap, probs, correct
 
-
-# ──────────────────────────────────────────────────────
-# PLOT HELPERS
-# ──────────────────────────────────────────────────────
 def plot_stream(stream: torch.Tensor, theme_name: str):
     fig, axes = plt.subplots(1, 5, figsize=(14, 3))
     fig.patch.set_facecolor("#141414")
@@ -283,16 +203,13 @@ def plot_stream(stream: torch.Tensor, theme_name: str):
         img = stream[t].permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 1)
         ax.imshow(img)
-        ax.set_title(f"T+{t}", fontsize=8, color="#888",
-                     fontfamily="monospace", pad=4)
+        ax.set_title(f"T+{t}", fontsize=8, color="#888", fontfamily="monospace", pad=4)
         ax.axis("off")
         for spine in ax.spines.values():
             spine.set_edgecolor("#2a2a2a")
-    fig.suptitle(f"Theme: {theme_name}", fontsize=9, color="#7a6a50",
-                 fontfamily="monospace", y=0.02)
+    fig.suptitle(f"Theme: {theme_name}", fontsize=9, color="#7a6a50", fontfamily="monospace", y=0.02)
     plt.tight_layout(pad=0.5)
     return fig
-
 
 def plot_confidence(probs: np.ndarray, pred_id: int):
     fig, ax = plt.subplots(figsize=(5, 2.6))
@@ -319,17 +236,14 @@ def plot_confidence(probs: np.ndarray, pred_id: int):
     plt.tight_layout(pad=0.6)
     return fig
 
-
 def plot_loss(t_hist, v_hist):
     fig, ax = plt.subplots(figsize=(5, 2.8))
     fig.patch.set_facecolor("#141414")
     ax.set_facecolor("#141414")
 
     epochs = range(1, len(t_hist) + 1)
-    ax.plot(epochs, t_hist, color="#c8975a", marker="o", markersize=3,
-            linewidth=1.5, label="Train")
-    ax.plot(epochs, v_hist, color="#5a9a6a", marker="x", markersize=4,
-            linewidth=1.5, label="Val")
+    ax.plot(epochs, t_hist, color="#c8975a", marker="o", markersize=3, linewidth=1.5, label="Train")
+    ax.plot(epochs, v_hist, color="#5a9a6a", marker="x", markersize=4, linewidth=1.5, label="Val")
 
     ax.set_xlabel("Epoch", fontsize=8, color="#666", fontfamily="monospace")
     ax.set_ylabel("Loss", fontsize=8, color="#666", fontfamily="monospace")
@@ -344,10 +258,6 @@ def plot_loss(t_hist, v_hist):
     plt.tight_layout(pad=0.6)
     return fig
 
-
-# ──────────────────────────────────────────────────────
-# HEADER
-# ──────────────────────────────────────────────────────
 st.markdown(
     """
     <div class="evo-header">
@@ -362,21 +272,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ──────────────────────────────────────────────────────
-# LOAD / TRAIN MODEL
-# ──────────────────────────────────────────────────────
-train_placeholder = st.empty()
-train_placeholder.markdown(
-    '<div class="train-status">Initialising model — training in progress, please wait...</div>',
-    unsafe_allow_html=True,
-)
-
 model, t_hist, v_hist = load_trained_model()
-train_placeholder.empty()
 
-# ──────────────────────────────────────────────────────
-# STAT PILLS
-# ──────────────────────────────────────────────────────
 final_train = t_hist[-1]
 final_val   = v_hist[-1]
 
@@ -412,9 +309,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ──────────────────────────────────────────────────────
-# MAIN LAYOUT
-# ──────────────────────────────────────────────────────
 left_col, right_col = st.columns([1, 2], gap="large")
 
 with left_col:
@@ -451,11 +345,9 @@ with right_col:
                 model, selected_id
             )
 
-        # ── Temporal image stream
         st.markdown('<div class="section-label">Temporal Image Stream</div>', unsafe_allow_html=True)
         st.pyplot(plot_stream(stream, selected_name), use_container_width=True)
 
-        # ── Caption output
         match_line = (
             '<div class="cap-match">PREDICTION CORRECT</div>'
             if correct else
@@ -472,7 +364,6 @@ with right_col:
             unsafe_allow_html=True,
         )
 
-        # ── Ground truth + confidence
         gt_col, conf_col = st.columns(2, gap="medium")
 
         with gt_col:
